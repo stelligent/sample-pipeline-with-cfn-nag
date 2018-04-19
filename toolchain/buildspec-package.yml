@@ -1,0 +1,17 @@
+version: 0.2
+
+phases:
+  pre_build: 
+    commands:
+      - go get github.com/aws/aws-lambda-go/lambda
+      - go vet .
+  build:
+    commands:
+      - go build -o main
+      - aws cloudformation package --template-file app.yml --s3-bucket ${S3_BUCKET} --output-template-file app-packaged.yml
+
+artifacts:
+  type: zip
+  files:
+  - toolchain/*
+  - app-packaged.yml

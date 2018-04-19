@@ -1,0 +1,346 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Continuous delivery pipeline of a simple Lambda webapp
+Parameters:
+  GitHubUser:
+    Type: String
+    Description: GitHub User
+    Default: "stelligent"
+  GitHubRepo:
+    Type: String
+    Description: GitHub Repo to pull from. Only the Name. not the URL
+    Default: "sample-pipeline-with-cfn-nag"
+  GitHubBranch:
+    Type: String
+    Description: GitHub Branch
+    Default: "master"
+  GitHubToken:
+    NoEcho: true
+    Type: String
+    Description: Secret. It might look something like 9b189a1654643522561f7b3ebd44a1531a4287af OAuthToken with access to Repo. Go to https://github.com/settings/tokens
+    MinLength: 40
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "GitHub Configuration"
+        Parameters:
+          - GitHubToken
+          - GitHubUser
+          - GitHubRepo
+          - GitHubBranch
+    ParameterLabels:
+      GitHubToken:
+        default: GitHub OAuth2 Token
+      GitHubUser: 
+        default: GitHub User/Org Name
+      GitHubRepo: 
+        default: GitHub Repository Name
+      GitHubBranch: 
+        default: GitHub Branch Name
+Resources:
+  CodeBuildPackage:
+    Type: AWS::CodeBuild::Project
+    DependsOn: CodeBuildRole
+    Properties:
+      Name: !Sub ${AWS::StackName}-package
+      Description: Package application for deployment
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: linuxContainer
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/golang:1.10
+        EnvironmentVariables:
+          - Name: S3_BUCKET
+            Value: !Ref PipelineBucket
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: toolchain/buildspec-package.yml
+      TimeoutInMinutes: 10
+  PipelineBucket:
+    Type: AWS::S3::Bucket
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${AWS::StackName}
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      Stages:
+      - Name: Source
+        Actions:
+        - InputArtifacts: []
+          Name: Source
+          ActionTypeId:
+            Category: Source
+            Owner: ThirdParty
+            Version: '1'
+            Provider: GitHub
+          OutputArtifacts:
+          - Name: SourceOutput
+          Configuration:
+            Owner: !Ref GitHubUser
+            Repo: !Ref GitHubRepo
+            Branch: !Ref GitHubBranch
+            OAuthToken: !Ref GitHubToken
+          RunOrder: 1
+      - Name: Build
+        Actions:
+        - Name: Package
+          ActionTypeId:
+            Category: Build
+            Owner: AWS
+            Version: '1'
+            Provider: CodeBuild
+          InputArtifacts:
+          - Name: SourceOutput
+          OutputArtifacts:
+          - Name: PackageOutput
+          Configuration:
+            ProjectName: !Ref CodeBuildPackage
+          RunOrder: 1
+      - Name: Deploy
+        Actions:
+        - Name: CfnNag
+          ActionTypeId:
+            Category: Invoke
+            Owner: AWS
+            Version: '1'
+            Provider: Lambda
+          InputArtifacts:
+          - Name: PackageOutput
+          Configuration:
+            FunctionName: cfn-nag-pipeline
+            UserParameters: app-packaged.yml
+          RunOrder: 1
+        - Name: CreateChangeSet
+          InputArtifacts:
+          - Name: PackageOutput
+          ActionTypeId:
+            Category: Deploy
+            Owner: AWS
+            Version: 1
+            Provider: CloudFormation
+          Configuration:
+            ActionMode: CHANGE_SET_REPLACE
+            Capabilities: CAPABILITY_NAMED_IAM
+            StackName: sample-app
+            TemplatePath: PackageOutput::app-packaged.yml
+            ChangeSetName: sample-app-deployment
+            RoleArn: !GetAtt CloudFormationRole.Arn
+          RunOrder: 2
+        - Name: ExecuteChangeSet
+          InputArtifacts:
+          - Name: PackageOutput
+          ActionTypeId:
+            Category: Deploy
+            Owner: AWS
+            Version: 1
+            Provider: CloudFormation
+          Configuration:
+            ActionMode: CHANGE_SET_EXECUTE
+            StackName: sample-app
+            ChangeSetName: sample-app-deployment
+          RunOrder: 3 
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineBucket
+  CloudFormationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - cloudformation.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: deploy-serverless-application
+        PolicyDocument:
+          Statement:
+          - Action:
+            - s3:GetObject
+            - s3:GetObjectVersion
+            Resource: 
+            - !Sub arn:aws:s3:::${PipelineBucket}/*
+            Effect: Allow
+          - Action:
+            - lambda:AddPermission
+            - lambda:CreateAlias
+            - lambda:CreateFunction
+            - lambda:DeleteFunction
+            - lambda:UpdateFunctionCode
+            - lambda:GetFunctionConfiguration
+            - lambda:UpdateFunctionConfiguration
+            - lambda:UpdateAlias
+            - lambda:RemovePermission
+            - lambda:PublishVersion
+            - lambda:InvokeFunction
+            Resource:
+            - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:sample-app-HelloFunction-*
+            Effect: Allow
+          - Action:
+            - apigateway:GET
+            - apigateway:POST
+            - apigateway:PUT
+            - apigateway:PATCH
+            - apigateway:DELETE
+            Resource:
+            - !Sub arn:aws:apigateway:${AWS::Region}::/restapis
+            - !Sub arn:aws:apigateway:${AWS::Region}::/restapis/*
+            Effect: Allow
+          - Action:
+            - lambda:ListTags
+            - lambda:TagResource
+            - lambda:UntagResource
+            Resource: '*'
+            Effect: Allow
+          - Action:
+            - iam:CreateRole
+            - iam:DeleteRole
+            - iam:PassRole
+            - iam:GetRole
+            - iam:PutRolePolicy
+            - iam:DeleteRolePolicy
+            - iam:AttachRolePolicy
+            - iam:DetachRolePolicy
+            - iam:GetRolePolicy
+            - iam:ListRolePolicies
+            - iam:UpdateAssumeRolePolicy
+            Effect: Allow
+            Resource: 
+            - !Sub arn:aws:iam::${AWS::AccountId}:role/sample-app-HelloFunctionRole-*
+          - Action:
+            - cloudformation:CreateChangeSet
+            Resource: 
+            - !Sub arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
+            Effect: Allow
+          Version: '2012-10-17'
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - codebuild.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      
+      Policies:
+      - PolicyName: codepipeline-integration
+        PolicyDocument:
+          Statement:
+          - Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:GetObjectVersion
+            Resource: 
+            - !Sub arn:aws:s3:::${PipelineBucket}/*
+            Effect: Allow
+          - Action:
+            - s3:ListBucket
+            - s3:ListBucketMultipartUploads
+            - s3:GetBucketVersioning
+            Resource: 
+            - !Sub arn:aws:s3:::${PipelineBucket}
+            Effect: Allow
+          - Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+            - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-*
+            - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-*:*
+            Effect: Allow
+          - Action:
+            - codepipeline:GetPipelineState
+            Effect: Allow
+            Resource:
+            - !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}
+          - Action:
+            - codepipeline:GetJobDetails
+            - codepipeline:PollForJobs
+            Effect: Allow
+            Resource:
+            - !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}
+          - Action:
+            - codepipeline:AcknowledgeJob
+            - codepipeline:PutJobFailureResult
+            - codepipeline:PutJobSuccessResult
+            Effect: Allow
+            Resource: '*'
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - codepipeline.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: codepipeline-service
+        PolicyDocument:
+          Statement:
+          - Action:
+            - codebuild:StartBuild
+            - codebuild:StopBuild
+            - codebuild:BatchGetProjects
+            - codebuild:BatchGetBuilds
+            Resource: 
+            - !GetAtt CodeBuildPackage.Arn
+            Effect: Allow
+          - Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:GetObjectVersion
+            Resource: 
+            - !Sub arn:aws:s3:::${PipelineBucket}/*
+            Effect: Allow
+          - Action:
+            - s3:ListBucket
+            - s3:ListBucketMultipartUploads
+            - s3:GetBucketVersioning
+            Resource: 
+            - !Sub arn:aws:s3:::${PipelineBucket}
+            Effect: Allow
+          - Action:
+            - lambda:ListFunctions
+            Resource: '*'
+            Effect: Allow
+          - Action:
+            - lambda:InvokeFunction
+            Resource:
+            - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:cfn-nag-pipeline
+            Effect: Allow
+      - PolicyName: cloudformation-service
+        PolicyDocument:
+          Statement:
+          - Action:
+            - cloudformation:CreateChangeSet
+            - cloudformation:DescribeStacks
+            - cloudformation:DescribeChangeSet
+            - cloudformation:ExecuteChangeSet
+            - cloudformation:DeleteChangeSet
+            Resource: 
+            - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/sample-app/*
+            Effect: Allow
+          - Action:
+            - iam:PassRole
+            Resource: 
+            - !GetAtt CloudFormationRole.Arn
+            Effect: Allow
+          Version: '2012-10-17'
+Outputs:
+  CodePipelineUrl:
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}
+    Description: CodePipeline URL
